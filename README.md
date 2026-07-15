@@ -128,34 +128,6 @@ bash scripts/build.sh
 The project intentionally uses a small shell-based Swift/AppKit build rather
 than requiring an Xcode project.
 
-## Signed releases and one-command installation
-
-The recommended distribution path is:
-
-1. Sign the app with Developer ID and enable Hardened Runtime.
-2. Submit it to Apple Notary Service and staple the notarization ticket.
-3. Attach the signed, notarized ZIP or DMG to a GitHub Release.
-4. Publish a Homebrew Cask through a personal tap:
-
-   ```bash
-   brew tap Shadowyuan616/tap
-   brew install --cask codex-quota-bar
-   ```
-
-5. Add Sparkle later for in-app updates.
-
-The repository already includes the signing and notarization script:
-
-```bash
-DEVELOPER_ID_APPLICATION="Developer ID Application: Your Name (TEAMID)" \
-NOTARY_PROFILE="codex-quota-notary" \
-bash scripts/release-build.sh
-```
-
-No binary asset is attached yet because the maintainer machine does not
-currently have a Developer ID certificate. The Homebrew Cask will be enabled
-after the first signed and notarized release.
-
 ## Known limitations
 
 - The app relies on the local ChatGPT/Codex app-server protocol. Upstream

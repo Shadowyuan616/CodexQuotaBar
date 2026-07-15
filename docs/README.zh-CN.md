@@ -112,33 +112,6 @@ bash scripts/render-preview.sh
 bash scripts/build.sh
 ```
 
-## 一键安装发布方案
-
-适合普通用户的最终发布链路是：
-
-1. 使用 Developer ID 签名并启用 Hardened Runtime。
-2. 提交 Apple Notary Service 公证并 staple 公证票据。
-3. 将签名公证后的 ZIP 或 DMG 上传到 GitHub Releases。
-4. 建立 Homebrew Tap，提供：
-
-   ```bash
-   brew tap Shadowyuan616/tap
-   brew install --cask codex-quota-bar
-   ```
-
-5. 后续接入 Sparkle，在 App 内完成自动更新。
-
-当前仓库已经包含签名与公证脚本：
-
-```bash
-DEVELOPER_ID_APPLICATION="Developer ID Application: Your Name (TEAMID)" \
-NOTARY_PROFILE="codex-quota-notary" \
-bash scripts/release-build.sh
-```
-
-由于维护者机器尚未配置 Developer ID 证书，当前版本不提供二进制附件。
-Homebrew Cask 会在首个签名公证版本完成后启用。
-
 ## 已知限制
 
 - 依赖 ChatGPT/Codex 本地 app-server 协议；上游协议变更可能需要同步适配。

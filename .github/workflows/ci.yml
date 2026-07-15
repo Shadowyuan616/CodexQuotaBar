@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: macos-26
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          xcrun swiftc --version
+
+      - name: Run tests
+        run: bash scripts/test.sh
+
+      - name: Build app
+        run: bash scripts/build.sh
+
+      - name: Verify bundle
+        run: |
+          test -x dist/CodexQuotaBar.app/Contents/MacOS/CodexQuotaBar
+          test "$(plutil -extract LSMinimumSystemVersion raw dist/CodexQuotaBar.app/Contents/Info.plist)" = "14.0"
+          codesign --verify --deep --strict --verbose=2 dist/CodexQuotaBar.app

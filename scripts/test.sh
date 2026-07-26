@@ -30,3 +30,5 @@ swiftc \
   -o "$BUILD_DIR/CodexQuotaUITests"
 
 "$BUILD_DIR/CodexQuotaUITests"
+
+bash "$ROOT/Tests/AppIconAssetTests.sh"

@@ -12,8 +12,8 @@ enum DesignTokens {
     static let borderWidth: CGFloat = 1
     static let shadowOpacity: Float = 0.18
     static let shadowRadius: CGFloat = 16
-    static let statusBadgeWidth: CGFloat = 48
-    static let statusBadgeCapsuleWidth: CGFloat = 48
+    static let statusBadgeWidth: CGFloat = 46
+    static let statusBadgeCapsuleWidth: CGFloat = 46
     static let statusBadgeHeight: CGFloat = 24
     static let statusBadgeCornerRadius: CGFloat = 8
     static let panelVerticalGap: CGFloat = 6
@@ -862,8 +862,9 @@ final class MenuBarStatusView {
         let image = NSImage(size: size)
         image.lockFocus()
 
+        let capsuleDrawingRect = layout.capsuleFrame.insetBy(dx: 0, dy: 2)
         let capsulePath = NSBezierPath(
-            roundedRect: layout.capsuleFrame.insetBy(dx: 1, dy: 2),
+            roundedRect: capsuleDrawingRect,
             xRadius: layout.capsuleCornerRadius,
             yRadius: layout.capsuleCornerRadius
         )

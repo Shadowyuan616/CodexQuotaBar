@@ -25,6 +25,7 @@ swiftc \
   -o "$MACOS/CodexQuotaBar"
 
 cp "$ROOT/Resources/Info.plist" "$CONTENTS/Info.plist"
+cp "$ROOT/Resources/AppIcon.icns" "$RESOURCES/AppIcon.icns"
 chmod +x "$MACOS/CodexQuotaBar"
 
 if command -v codesign >/dev/null 2>&1; then

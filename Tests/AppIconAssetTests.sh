@@ -37,4 +37,12 @@ validation_dir="$(mktemp -d "${TMPDIR:-/tmp}/CodexQuotaBar-AppIcon.XXXXXX")"
 trap 'rm -rf "$validation_dir"' EXIT
 iconutil -c iconset "$ICNS" -o "$validation_dir/AppIcon.iconset"
 
+bundle_output="$ROOT/.build/app-icon-bundle-test"
+OUTPUT_DIR="$bundle_output" bash "$ROOT/scripts/build.sh" >/dev/null
+bundle="$bundle_output/CodexQuotaBar.app"
+test -f "$bundle/Contents/Resources/AppIcon.icns"
+bundle_icon_name="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIconFile" "$bundle/Contents/Info.plist")"
+test "$bundle_icon_name" = "AppIcon"
+codesign --verify --deep --strict "$bundle"
+
 echo "AppIconAssetTests passed"

@@ -197,14 +197,18 @@ struct CodexQuotaCoreTests {
 
         let executableCandidates = CodexExecutableLocator.defaultCandidatePaths(homeDirectory: "/Users/tester")
         expect(
-            executableCandidates.first == "/Applications/ChatGPT.app/Contents/Resources/codex",
-            "the unified ChatGPT app should be the first Codex executable candidate"
+            executableCandidates.first == "/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex",
+            "the current ChatGPT app should be the first Codex executable candidate"
+        )
+        expect(
+            executableCandidates.contains("/Applications/ChatGPT.app/Contents/Resources/codex"),
+            "the previous ChatGPT app layout should remain supported"
         )
         expect(
             executableCandidates.contains("/Applications/Codex.app/Contents/Resources/codex"),
             "the legacy Codex app should remain a supported fallback"
         )
-        expect(executableCandidates.count == 2, "default executable lookup should only trust system Applications bundles")
+        expect(executableCandidates.count == 3, "default executable lookup should only trust system Applications bundles")
         expect(!executableCandidates.contains("/opt/homebrew/bin/codex"), "default executable lookup should not execute Homebrew PATH candidates implicitly")
 
         let temporaryDirectory = FileManager.default.temporaryDirectory

@@ -291,6 +291,60 @@ struct CodexQuotaCoreTests {
             exit(1)
         }
 
+        var trendCalendar = Calendar(identifier: .gregorian)
+        trendCalendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        let dayStart = trendCalendar.startOfDay(for: Date(timeIntervalSince1970: 1_790_000_000))
+        let reset = Int(dayStart.timeIntervalSince1970) + 7 * 86400
+        func sample(_ seconds: Double, _ tokens: Int64, _ percent: Int, scope: String = "account-A", resetAt: Int? = nil) -> TokenQuotaSample {
+            TokenQuotaSample(timestamp: dayStart.addingTimeInterval(seconds), accountScope: scope,
+                             totalTokens: tokens, usedPercent: percent, resetsAt: resetAt ?? reset)
+        }
+        var trend = TokenQuotaTrend()
+        trend.record(sample(10, 1000, 10), calendar: trendCalendar)
+        trend.record(sample(20, 1200, 10), calendar: trendCalendar)
+        expect(trend.days.isEmpty, "unchanged integer quota must not create a zero denominator")
+        trend.record(sample(30, 2000, 12), calendar: trendCalendar)
+        expect(trend.days.first?.tokensPerPercent == 500, "tokens before a rounded quota change must remain included")
+        trend.record(sample(40, 2600, 13), calendar: trendCalendar)
+        expect(trend.days.first?.percentagePoints == 3 && trend.days.first?.tokens == 1600, "daily ratio must use summed tokens divided by summed percentage points")
+        trend.record(sample(50, 3000, 0, resetAt: reset + 10), calendar: trendCalendar)
+        expect(trend.days.first?.tokens == 1600, "a quota reset must not create a trend interval")
+        trend.record(sample(86410, 5000, 10, resetAt: reset + 10), calendar: trendCalendar)
+        expect(trend.days.count == 1, "cross-midnight gaps must not be attributed to one day")
+        trend.record(sample(86420, 5400, 11, resetAt: reset + 10), calendar: trendCalendar)
+        expect(trend.days.last?.tokensPerPercent == 400, "a new day should start its own paired measurements")
+        trend.record(sample(86430, 400, 12, resetAt: reset + 10), calendar: trendCalendar)
+        expect(trend.days.last?.tokens == 400, "token counter rollback must reset the baseline")
+        trend.record(sample(86440, 600, 13, scope: "account-B"), calendar: trendCalendar)
+        expect(trend.days.isEmpty, "account switches must not mix histories")
+        do {
+            let mockClient = CodexAppServerClient(codexPath: CommandLine.arguments[1])
+            let scope = CodexAppServerClient.accountScope("fixture-account")
+            let mockOutcome = try mockClient.consumeReset(ResetAttempt(key: "fixture-key", creditId: "fixture-credit", accountScope: scope))
+            expect(mockOutcome == .alreadyRedeemed, "redemption should preserve the key and selected card and treat repeat success as success")
+            do {
+                _ = try mockClient.consumeReset(ResetAttempt(key: "fixture-key", creditId: "fixture-credit", accountScope: "wrong-account"))
+                expect(false, "account changes must prevent redemption")
+            } catch { expect(String(describing: error).contains("账户已变化"), "account mismatch must stop before mutation") }
+            let mockSample = try mockClient.fetchTrendSample()
+            expect(mockSample.totalTokens == 1234567 && mockSample.usedPercent == 95, "trend samples must pair server tokens with the weekly used quota")
+            let attempts = ResetAttemptStore(fileURL: storageFixture.appendingPathComponent("pending/reset.json"))
+            let first = try attempts.begin(creditId: "test-card", accountScope: "test-scope")
+            let retry = try ResetAttemptStore(fileURL: storageFixture.appendingPathComponent("pending/reset.json")).begin(creditId: nil, accountScope: "different")
+            expect(first == retry, "uncertain redemption must retain its key, card and account across app restarts")
+            try attempts.complete()
+            let next = try attempts.begin(creditId: nil, accountScope: "test-scope")
+            expect(next.key != first.key, "a completed attempt must not be reused for a new redemption")
+            for outcome in ["reset", "alreadyRedeemed", "nothingToReset", "noCredit"] {
+                let decoded = try JSONDecoder().decode(ResetResponse.self, from: Data("{\"outcome\":\"\(outcome)\"}".utf8))
+                expect(decoded.outcome.rawValue == outcome, "all server reset outcomes must be understood")
+            }
+            var scoped = rateLimits
+            scoped.accountId = "private-account-id"
+            let encoded = try JSONEncoder().encode(scoped)
+            expect(!String(decoding: encoded, as: UTF8.self).contains("private-account-id"), "raw account identity must not be cached")
+        } catch { fatalError("feature verification failed: \(error)") }
+
         print("CodexQuotaCoreTests passed")
     }
 }

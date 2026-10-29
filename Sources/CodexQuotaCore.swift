@@ -4,10 +4,32 @@ struct AccountRateLimitsResponse: Codable {
     let rateLimits: RateLimitSnapshot?
     let rateLimitsByLimitId: [String: RateLimitSnapshot]?
     let rateLimitResetCredits: RateLimitResetCreditsSummary?
+    var accountId: String? = nil
+
+    private enum CodingKeys: String, CodingKey {
+        case rateLimits, rateLimitsByLimitId, rateLimitResetCredits, accountId
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(rateLimits, forKey: .rateLimits)
+        try container.encodeIfPresent(rateLimitsByLimitId, forKey: .rateLimitsByLimitId)
+        try container.encodeIfPresent(rateLimitResetCredits, forKey: .rateLimitResetCredits)
+    }
 }
 
 struct RateLimitResetCreditsSummary: Codable {
     let availableCount: Int
+    var credits: [RateLimitResetCredit]? = nil
+}
+
+struct RateLimitResetCredit: Codable {
+    let id: String
+    let resetType: String
+    let status: String
+    let expiresAt: Int?
+    let title: String?
+    let description: String?
 }
 
 struct RateLimitSnapshot: Codable {
@@ -300,6 +322,131 @@ struct QuotaHistoryPoint: Codable, Equatable {
     let timestamp: Date
     let fiveHourUsedPercent: Int
     let weeklyUsedPercent: Int
+}
+
+enum ResetOutcome: String, Decodable {
+    case reset, alreadyRedeemed, nothingToReset, noCredit
+
+    var message: String {
+        switch self {
+        case .reset, .alreadyRedeemed: return "已使用，正在更新限额"
+        case .nothingToReset: return "当前额度尚不满足重置条件"
+        case .noCredit: return "暂无可用重置卡"
+        }
+    }
+}
+
+struct ResetResponse: Decodable { let outcome: ResetOutcome }
+
+struct ResetAttempt: Codable, Equatable {
+    let key: String
+    let creditId: String?
+    let accountScope: String
+}
+
+final class ResetAttemptStore {
+    private let fileURL: URL
+    init(fileURL: URL = FileManager.default.codexQuotaBarContainerURL.appendingPathComponent("pending-reset.json")) {
+        self.fileURL = fileURL
+    }
+    func load() -> ResetAttempt? {
+        guard let data = try? Data(contentsOf: fileURL) else { return nil }
+        return try? JSONDecoder().decode(ResetAttempt.self, from: data)
+    }
+    func begin(creditId: String?, accountScope: String) throws -> ResetAttempt {
+        if let existing = load() { return existing }
+        guard !FileManager.default.fileExists(atPath: fileURL.path) else {
+            throw CodexAppServerClientError.serverError("重置操作记录不可读")
+        }
+        // Persist before sending; an uncertain result must reuse this key even after restart.
+        let attempt = ResetAttempt(key: UUID().uuidString, creditId: creditId, accountScope: accountScope)
+        try SecureLocalFileStore.write(JSONEncoder().encode(attempt), to: fileURL)
+        return attempt
+    }
+    func complete() throws {
+        if FileManager.default.fileExists(atPath: fileURL.path) { try FileManager.default.removeItem(at: fileURL) }
+    }
+}
+
+struct TokenUsageResponse: Decodable {
+    struct Summary: Decodable { let lifetimeTokens: Int64? }
+    let summary: Summary
+}
+
+struct TokenQuotaSample: Codable, Equatable {
+    let timestamp: Date
+    let accountScope: String
+    let totalTokens: Int64
+    let usedPercent: Int
+    let resetsAt: Int
+}
+
+struct TokenQuotaDay: Codable, Equatable {
+    let day: Date
+    var tokens: Int64
+    var percentagePoints: Int
+    var tokensPerPercent: Double { Double(tokens) / Double(max(1, percentagePoints)) }
+    var estimatedWeeklyTokens: Double { tokensPerPercent * 100 }
+}
+
+struct TokenQuotaTrend: Codable {
+    var baseline: TokenQuotaSample?
+    var days: [TokenQuotaDay] = []
+    var accountScope: String?
+    var lastSampleAt: Date?
+
+    mutating func record(_ sample: TokenQuotaSample, calendar: Calendar = .current) {
+        guard (0...100).contains(sample.usedPercent), sample.totalTokens >= 0 else { return }
+        if let lastSampleAt, sample.timestamp <= lastSampleAt { return }
+        if accountScope != sample.accountScope {
+            days = []
+            baseline = nil
+            accountScope = sample.accountScope
+        }
+        lastSampleAt = sample.timestamp
+        let day = calendar.startOfDay(for: sample.timestamp)
+        days.removeAll { $0.day < calendar.date(byAdding: .day, value: -29, to: day)! }
+        guard let previous = baseline else { baseline = sample; return }
+        // Never join samples across midnight, a reset, an account switch, or a counter rollback.
+        guard calendar.isDate(previous.timestamp, inSameDayAs: sample.timestamp),
+              previous.accountScope == sample.accountScope, previous.resetsAt == sample.resetsAt,
+              sample.timestamp.timeIntervalSince1970 < Double(sample.resetsAt),
+              sample.usedPercent >= previous.usedPercent, sample.totalTokens >= previous.totalTokens else {
+            baseline = sample
+            return
+        }
+        let percentage = sample.usedPercent - previous.usedPercent
+        let tokens = sample.totalTokens - previous.totalTokens
+        // Keep the original baseline while percentages round to the same integer or token totals lag.
+        guard percentage > 0, tokens > 0 else { return }
+        if let index = days.firstIndex(where: { $0.day == day }) {
+            let sum = days[index].tokens.addingReportingOverflow(tokens)
+            guard !sum.overflow else { baseline = sample; return }
+            days[index].tokens = sum.partialValue
+            days[index].percentagePoints += percentage
+        } else {
+            days.append(TokenQuotaDay(day: day, tokens: tokens, percentagePoints: percentage))
+        }
+        days.sort { $0.day < $1.day }
+        baseline = sample
+    }
+}
+
+final class TokenQuotaTrendStore {
+    private let fileURL: URL
+    init(fileURL: URL = FileManager.default.codexQuotaBarContainerURL.appendingPathComponent("token-quota-trend.json")) {
+        self.fileURL = fileURL
+    }
+    func load() -> TokenQuotaTrend {
+        guard let data = try? Data(contentsOf: fileURL),
+              let value = try? JSONDecoder().decode(TokenQuotaTrend.self, from: data) else { return TokenQuotaTrend() }
+        return value
+    }
+    func save(_ value: TokenQuotaTrend) {
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        try? SecureLocalFileStore.write(data, to: fileURL)
+    }
+    func clear() { try? FileManager.default.removeItem(at: fileURL) }
 }
 
 enum SecureLocalFileStore {

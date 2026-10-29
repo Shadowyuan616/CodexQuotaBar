@@ -17,6 +17,8 @@ app-server.
 
 ![CodexQuotaBar preview](docs/images/preview.png)
 
+Preview uses demo data. The app's interface labels are currently in Chinese.
+
 ## Features
 
 - Compact menu bar status with remaining quota, reset time, and an API health indicator.
@@ -24,6 +26,8 @@ app-server.
 - Automatically switches the menu bar value and reset label when no 5-hour limit is returned.
 - Fixed auto-refresh choices: 10 seconds, 30 seconds, 1 minute, 5 minutes, and 15 minutes.
 - Keeps the last quota value visible while refreshing; only the health indicator turns blue.
+- Expiry-sorted reset-card list with inline confirmation and cancellation; only the earliest-expiring card can be used.
+- Daily estimated weekly Token-capacity trend, displayed in the same 250pt-wide panel.
 - Native Liquid Glass on macOS 26 and later.
 - `NSVisualEffectView` compatibility fallback on macOS 14-25.
 - Local cache for the latest successful quota response, with sanitized error states.
@@ -95,21 +99,60 @@ The health indicator is green when online, blue while refreshing, red on an
 error, and gray when unavailable. Quota colors are based on the amount
 remaining: green for 20%-100%, yellow for 5%-20%, and red for 0%-5%.
 
+## Reset cards and Token trend
+
+The 250pt popover also shows earned reset cards and their expiry dates when
+provided, in a list sorted by expiry. Each row shows its expiry date and time;
+only the earliest-expiring available card enables **使用** (Use).
+
+1. Click **使用** to arm confirmation. No card is redeemed on this first click.
+2. Click the red **确认使用？** (Confirm use?) within eight seconds to redeem it.
+3. To back out, click **取消** (Cancel) to its left. Closing the panel, a refresh,
+   or letting the eight-second window expire also cancels confirmation.
+
+![Inline reset confirmation and cancel button, using demo data](docs/images/reset-confirmation.png)
+
+More than three rows scroll within the list. Incomplete
+card details disable redemption until the earliest card can be determined.
+The server decides whether your quota is eligible.
+An uncertain result can be retried with the same persisted request ID without
+consuming a second card; retries are bound to the original account.
+
+The daily **周额度折算** chart estimates full weekly Token capacity as
+`observed Token increase / (weekly used-percentage-point increase / 100)`.
+For example, 100,000 Tokens using 2% gives an estimated 5 million Tokens/week.
+It shows the last 14 days using daily weighted totals, not averages of ratios.
+Sampling occurs after successful refreshes, at most once every five minutes.
+Only paired observations within the same day and quota window are included.
+Resets, account/plan switches, and counter rollbacks break the baseline.
+The chart starts empty until a measurable change is observed; old percentage-only
+history cannot be backfilled. Account-wide Token activity and quota billing may
+have different scopes, so this is an observation-based estimate, not an official
+fixed allowance. Hover the chart for daily values.
+
+If the usage endpoint is unavailable, existing trend points remain visible and
+quota refreshes continue independently. The underlying methods are documented in
+the [official OpenAI App Server documentation](https://learn.chatgpt.com/docs/app-server).
+
 ## Privacy and security
 
 CodexQuotaBar does not directly read `~/.codex/auth.json`, Keychain items,
 browser cookies, access tokens, refresh tokens, or API keys. Authentication is
 delegated to the official local `codex app-server` process.
 
-The app requests only:
+The app uses these local app-server methods:
 
 ```text
 account/rateLimits/read
+account/usage/read
+account/rateLimitResetCredit/consume  # only after two-click confirmation
 ```
 
-It does not request `account/read` or `account/usage/read`. Local persistence is
-limited to quota data, refresh timestamps, and daily quota percentages. Account
-email, token usage, credentials, and raw service errors are not stored. See
+It does not request `account/read`. Local data includes quota snapshots, reset-card
+details, one cumulative Token baseline, daily Token/quota increments, and a hashed
+account/plan scope. Pending reset attempts store an idempotency key, selected card
+ID, and hashed account scope. Raw account IDs, email, credentials, and raw service
+errors are not stored. See
 [SECURITY.md](SECURITY.md) for the complete security boundary.
 
 ## Development

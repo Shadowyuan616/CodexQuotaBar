@@ -21,7 +21,7 @@ enum DesignTokens {
     static let panelTopSafetyInset: CGFloat = 6
     static let panelMinHeight: CGFloat = 143
     static let panelSingleLimitMinHeight: CGFloat = 104
-    static let panelMaxHeight: CGFloat = 190
+    static let panelMaxHeight: CGFloat = 470
     static let quotaCardHeight: CGFloat = 112
     static let compactQuotaCardHeight: CGFloat = 96
     static let compactSingleQuotaCardHeight: CGFloat = 58
@@ -129,6 +129,11 @@ struct QuotaPanelViewModel {
     let lastError: String?
     let lastUpdatedAt: Date?
     let refreshIntervalMinutes: Int
+    var tokenTrend = TokenQuotaTrend()
+    var trendMessage: String? = nil
+    var resetBusy = false
+    var resetMessage: String? = nil
+    var resetRetry = false
 
     var statusBadgeWindowSummary: QuotaWindowSummary? {
         viewModel?.fiveHourWindowSummary ?? viewModel?.weeklyWindowSummary
@@ -225,6 +230,14 @@ final class CodexQuotaBarDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     private let quotaService = QuotaService()
     private let quotaCache = QuotaCache()
     private let historyStore = QuotaHistoryStore()
+    private let tokenTrendStore = TokenQuotaTrendStore()
+    private let resetAttemptStore = ResetAttemptStore()
+    private var tokenTrend = TokenQuotaTrend()
+    private var trendMessage: String?
+    private var trendFetchInProgress = false
+    private var lastTrendAttempt: Date?
+    private var resetBusy = false
+    private var resetMessage: String?
     private let runtimeMonitor = CodexRuntimeMonitor()
     private let settingsStore = QuotaSettingsStore()
     private var refreshScheduler: RefreshScheduler?
@@ -255,6 +268,7 @@ final class CodexQuotaBarDelegate: NSObject, NSApplicationDelegate, NSWindowDele
 
         autoRefreshIntervalSeconds = settingsStore.autoRefreshIntervalSeconds
         history = historyStore.load()
+        tokenTrend = tokenTrendStore.load()
         loadCachedState()
         configureStatusButton()
         renderPopover()
@@ -386,6 +400,8 @@ final class CodexQuotaBarDelegate: NSObject, NSApplicationDelegate, NSWindowDele
     }
 
     @objc private func clearLocalCache() {
+        tokenTrendStore.clear()
+        tokenTrend = TokenQuotaTrend()
         historyStore.clear()
         quotaCache.clear()
         history = []
@@ -411,12 +427,17 @@ final class CodexQuotaBarDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             history: history,
             lastError: lastError,
             lastUpdatedAt: viewModel?.snapshot.fetchedAt,
-            refreshIntervalMinutes: refreshIntervalMinutesForStatus
+            refreshIntervalMinutes: refreshIntervalMinutesForStatus,
+            tokenTrend: tokenTrend,
+            trendMessage: trendMessage,
+            resetBusy: resetBusy,
+            resetMessage: resetMessage,
+            resetRetry: resetAttemptStore.load() != nil
         )
     }
 
     private func refresh() {
-        if isRefreshing { return }
+        if isRefreshing || resetBusy { return }
         if let pauseUntil = refreshPausedUntil, pauseUntil > Date() {
             return
         }
@@ -437,6 +458,14 @@ final class CodexQuotaBarDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 self.isRefreshing = false
                 switch result {
                 case .success(let snapshot):
+                    if let account = snapshot.rateLimits?.accountId {
+                        let scope = CodexAppServerClient.accountScope(account + "|" + (snapshot.rateLimits?.rateLimits?.planType ?? ""))
+                        if let previous = self.tokenTrend.accountScope, previous != scope {
+                            self.tokenTrend = TokenQuotaTrend(accountScope: scope)
+                            self.tokenTrendStore.save(self.tokenTrend)
+                            self.lastTrendAttempt = nil
+                        }
+                    }
                     let effectiveSnapshot = snapshot
                     let viewModel = QuotaViewModel(snapshot: effectiveSnapshot)
                     self.viewModel = viewModel
@@ -488,7 +517,65 @@ final class CodexQuotaBarDelegate: NSObject, NSApplicationDelegate, NSWindowDele
                 self.refreshPausedUntil = nil
                 self.updateStatusBadge()
                 self.renderPopover()
+                if case .success = result { self.sampleTokenTrendIfNeeded() }
             }
+        }
+    }
+
+    private func sampleTokenTrendIfNeeded() {
+        guard !trendFetchInProgress, !resetBusy,
+              lastTrendAttempt.map({ Date().timeIntervalSince($0) >= 300 }) ?? true else { return }
+        lastTrendAttempt = Date()
+        trendFetchInProgress = true
+        quotaService.fetchTokenTrend { [weak self] result in
+            guard let self else { return }
+            self.trendFetchInProgress = false
+            // A reset requested during this sample invalidates its baseline.
+            guard !self.resetBusy else { return }
+            switch result {
+            case .success(let sample):
+                self.tokenTrend.record(sample)
+                self.tokenTrendStore.save(self.tokenTrend)
+                self.trendMessage = nil
+            case .failure:
+                self.trendMessage = "Token 采样暂不可用"
+            }
+            self.renderPopover()
+        }
+    }
+
+    private func redeemReset(creditId: String?) {
+        guard !resetBusy, !isRefreshing else { return }
+        guard let accountID = viewModel?.snapshot.rateLimits?.accountId else {
+            resetMessage = "请先刷新以确认当前账户"
+            renderPopover()
+            return
+        }
+        let attempt: ResetAttempt
+        do { attempt = try resetAttemptStore.begin(creditId: creditId, accountScope: CodexAppServerClient.accountScope(accountID)) }
+        catch { resetMessage = "无法保存操作状态，请重试"; renderPopover(); return }
+        resetBusy = true
+        resetMessage = "正在使用重置卡…"
+        tokenTrend.baseline = nil
+        tokenTrendStore.save(tokenTrend)
+        renderPopover()
+        quotaService.consumeReset(attempt) { [weak self] result in
+            guard let self else { return }
+            self.resetBusy = false
+            switch result {
+            case .success(let outcome):
+                do {
+                    try self.resetAttemptStore.complete()
+                    self.resetMessage = outcome.message
+                } catch { self.resetMessage = "已返回结果，本地状态未清理；重试不会重复扣卡" }
+            case .failure(let error):
+                self.resetMessage = String(describing: error).contains("账户已变化")
+                    ? "请切回发起重置的账户后重试" : "结果未确认；重试同一操作"
+            }
+            self.lastTrendAttempt = nil
+            self.refreshPausedUntil = nil
+            self.renderPopover()
+            self.refresh()
         }
     }
 
@@ -573,7 +660,8 @@ final class CodexQuotaBarDelegate: NSObject, NSApplicationDelegate, NSWindowDele
             pauseAutoRefreshAction: { [weak self] in self?.pauseAutoRefresh() },
             openLogDirectoryAction: { [weak self] in self?.openLogDirectory() },
             clearLocalCacheAction: { [weak self] in self?.clearLocalCache() },
-            quitAction: { [weak self] in self?.quit() }
+            quitAction: { [weak self] in self?.quit() },
+            resetAction: { [weak self] creditId in self?.redeemReset(creditId: creditId) }
         )
         panelController.updateContent(controller)
     }
@@ -659,6 +747,7 @@ final class QuotaPanelWindowController: NSWindowController {
     }
 
     override func close() {
+        (hostedViewController?.view as? QuotaPopoverView)?.cancelResetConfirmation()
         window?.orderOut(nil)
         stopDismissMonitoring()
     }
@@ -1000,6 +1089,7 @@ final class MenuBarStatusView {
 }
 
 final class QuotaPopoverViewController: NSViewController {
+    private let resetAction: (String?) -> Void
     private let model: QuotaPanelViewModel
     private let refreshAction: () -> Void
     private let detailsAction: () -> Void
@@ -1019,7 +1109,8 @@ final class QuotaPopoverViewController: NSViewController {
         pauseAutoRefreshAction: @escaping () -> Void,
         openLogDirectoryAction: @escaping () -> Void,
         clearLocalCacheAction: @escaping () -> Void,
-        quitAction: @escaping () -> Void
+        quitAction: @escaping () -> Void,
+        resetAction: @escaping (String?) -> Void = { _ in }
     ) {
         self.model = model
         self.refreshAction = refreshAction
@@ -1030,6 +1121,7 @@ final class QuotaPopoverViewController: NSViewController {
         self.openLogDirectoryAction = openLogDirectoryAction
         self.clearLocalCacheAction = clearLocalCacheAction
         self.quitAction = quitAction
+        self.resetAction = resetAction
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -1047,7 +1139,8 @@ final class QuotaPopoverViewController: NSViewController {
             pauseAutoRefreshAction: pauseAutoRefreshAction,
             openLogDirectoryAction: openLogDirectoryAction,
             clearLocalCacheAction: clearLocalCacheAction,
-            quitAction: quitAction
+            quitAction: quitAction,
+            resetAction: resetAction
         )
         view = popover
         view.translatesAutoresizingMaskIntoConstraints = false
@@ -1070,6 +1163,8 @@ private extension NSStackView {
 }
 
 class QuotaPopoverView: GlassPanel {
+    private let resetAction: (String?) -> Void
+    private var resetSection: ResetCreditsSectionView?
     private let model: QuotaPanelViewModel
     private let refreshAction: () -> Void
     private let detailsAction: () -> Void
@@ -1089,7 +1184,8 @@ class QuotaPopoverView: GlassPanel {
         pauseAutoRefreshAction: @escaping () -> Void,
         openLogDirectoryAction: @escaping () -> Void,
         clearLocalCacheAction: @escaping () -> Void,
-        quitAction: @escaping () -> Void
+        quitAction: @escaping () -> Void,
+        resetAction: @escaping (String?) -> Void = { _ in }
     ) {
         self.model = model
         self.refreshAction = refreshAction
@@ -1100,6 +1196,7 @@ class QuotaPopoverView: GlassPanel {
         self.openLogDirectoryAction = openLogDirectoryAction
         self.clearLocalCacheAction = clearLocalCacheAction
         self.quitAction = quitAction
+        self.resetAction = resetAction
         super.init(frame: .zero)
     }
 
@@ -1129,6 +1226,21 @@ class QuotaPopoverView: GlassPanel {
         } else {
             stack.addFullWidthArrangedSubview(placeholderCard())
         }
+        stack.addFullWidthArrangedSubview(featureSeparator())
+        let resetSection = ResetCreditsSectionView(model: model, action: resetAction)
+        self.resetSection = resetSection
+        stack.addFullWidthArrangedSubview(resetSection)
+        stack.addFullWidthArrangedSubview(featureSeparator())
+        stack.addFullWidthArrangedSubview(TokenTrendSectionView(trend: model.tokenTrend, message: model.trendMessage))
+    }
+
+    func cancelResetConfirmation() { resetSection?.cancelConfirmation() }
+
+    private func featureSeparator() -> NSView {
+        let line = NSBox()
+        line.boxType = .separator
+        line.heightAnchor.constraint(equalToConstant: 1).isActive = true
+        return line
     }
 
     private func headerView() -> NSView {
@@ -1836,7 +1948,7 @@ final class CompactQuotaListView: NSView {
         row.distribution = .fill
         row.spacing = 6
 
-        let resetLabel = NSTextField(labelWithString: "重置次数：\(value)")
+        let resetLabel = NSTextField(labelWithString: "限额同步")
         resetLabel.identifier = NSUserInterfaceItemIdentifier("reset-credits-label")
         resetLabel.font = NSFont.systemFont(ofSize: 9, weight: .medium)
         resetLabel.textColor = DesignColors.secondaryText
@@ -1853,6 +1965,315 @@ final class CompactQuotaListView: NSView {
         row.addArrangedSubview(NSView())
         row.addArrangedSubview(refreshLabel)
         return row
+    }
+}
+
+final class ResetActionButton: NSButton {
+    override func draw(_ dirtyRect: NSRect) {
+        guard bezelColor == .systemRed else { super.draw(dirtyRect); return }
+        let fill = isHighlighted ? NSColor.systemRed.blended(withFraction: 0.15, of: .black)! : .systemRed
+        fill.setFill()
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 6, yRadius: 6).fill()
+        let attributes: [NSAttributedString.Key: Any] = [.font: font ?? NSFont.systemFont(ofSize: 11), .foregroundColor: NSColor.white]
+        let size = (title as NSString).size(withAttributes: attributes)
+        (title as NSString).draw(at: NSPoint(x: (bounds.width - size.width) / 2, y: (bounds.height - size.height) / 2), withAttributes: attributes)
+    }
+}
+
+final class ResetCreditsSectionView: NSView {
+    private let action: (String?) -> Void
+    private let retry: Bool
+    private let button = ResetActionButton()
+    private let cancelButton = NSButton(title: "取消", target: nil, action: nil)
+    private var credits: [RateLimitResetCredit] = []
+    private var armed = false
+    private var confirmationTimer: Timer?
+
+    init(model: QuotaPanelViewModel, action: @escaping (String?) -> Void) {
+        self.action = action
+        self.retry = model.resetRetry
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("reset-credits-section")
+        let summary = model.viewModel?.snapshot.rateLimits?.rateLimitResetCredits
+        credits = (summary?.credits ?? []).filter {
+            $0.status == "available" && $0.resetType == "codexRateLimits" &&
+            ($0.expiresAt.map { Double($0) > Date().timeIntervalSince1970 } ?? true)
+        }.sorted {
+            let left = $0.expiresAt ?? Int.max
+            let right = $1.expiresAt ?? Int.max
+            return left == right ? $0.id < $1.id : left < right
+        }
+        let title = NSTextField(labelWithString: "重置卡  \(summary.map { String($0.availableCount) } ?? "—") 张")
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        title.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        button.title = retry ? "重试" : "使用"
+        button.identifier = NSUserInterfaceItemIdentifier("use-reset-credit")
+        button.font = .systemFont(ofSize: 11, weight: .semibold)
+        button.bezelStyle = .rounded
+        button.target = self
+        button.action = #selector(useCredit)
+        let detailsComplete = summary?.availableCount == credits.count && !credits.isEmpty
+        button.isEnabled = !model.resetBusy && !model.isRefreshing &&
+            (retry || (model.loadState == .success && detailsComplete))
+        if model.resetBusy { button.title = "使用中…" }
+        button.widthAnchor.constraint(equalToConstant: 68).isActive = true
+        button.heightAnchor.constraint(equalToConstant: 24).isActive = true
+        cancelButton.identifier = NSUserInterfaceItemIdentifier("cancel-reset-credit")
+        cancelButton.font = .systemFont(ofSize: 10, weight: .medium)
+        cancelButton.bezelStyle = .rounded
+        cancelButton.target = self
+        cancelButton.action = #selector(cancelConfirmation)
+        cancelButton.isHidden = true
+        cancelButton.isEnabled = false
+        let actions = NSView()
+        actions.translatesAutoresizingMaskIntoConstraints = false
+        button.translatesAutoresizingMaskIntoConstraints = false
+        cancelButton.translatesAutoresizingMaskIntoConstraints = false
+        actions.addSubview(cancelButton)
+        actions.addSubview(button)
+        NSLayoutConstraint.activate([
+            actions.widthAnchor.constraint(equalToConstant: 104), actions.heightAnchor.constraint(equalToConstant: 24),
+            cancelButton.leadingAnchor.constraint(equalTo: actions.leadingAnchor),
+            cancelButton.centerYAnchor.constraint(equalTo: actions.centerYAnchor),
+            cancelButton.widthAnchor.constraint(equalToConstant: 32), cancelButton.heightAnchor.constraint(equalToConstant: 24),
+            button.trailingAnchor.constraint(equalTo: actions.trailingAnchor), button.centerYAnchor.constraint(equalTo: actions.centerYAnchor)
+        ])
+        let list = NSStackView()
+        list.orientation = .vertical
+        list.alignment = .width
+        list.spacing = 0
+        list.translatesAutoresizingMaskIntoConstraints = false
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd HH:mm"
+        for (index, credit) in credits.enumerated() {
+            let name = NSTextField(labelWithString: "重置卡 \(index + 1) · 到期时间")
+            name.font = .systemFont(ofSize: 9)
+            name.textColor = DesignColors.secondaryText
+            name.lineBreakMode = .byTruncatingTail
+            let expiry = NSTextField(labelWithString: credit.expiresAt.map {
+                formatter.string(from: Date(timeIntervalSince1970: Double($0)))
+            } ?? "无到期时间")
+            expiry.identifier = NSUserInterfaceItemIdentifier("reset-credit-expiry-\(index)")
+            expiry.font = .monospacedDigitSystemFont(ofSize: 10, weight: index == 0 ? .semibold : .regular)
+            expiry.textColor = DesignColors.primaryText
+            expiry.lineBreakMode = .byTruncatingTail
+            let info = NSStackView(views: [name, expiry])
+            info.orientation = .vertical
+            info.alignment = .leading
+            info.spacing = 1
+            info.toolTip = ([credit.title, credit.description].compactMap { $0 } + [expiry.stringValue]).joined(separator: "\n")
+            info.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let rowAction: NSView
+            if index == 0 && !retry {
+                rowAction = actions
+            } else {
+                let rowButton = NSButton(title: "使用", target: nil, action: nil)
+                rowButton.font = .systemFont(ofSize: 11, weight: .semibold)
+                rowButton.bezelStyle = .rounded
+                rowButton.isEnabled = false
+                rowButton.widthAnchor.constraint(equalToConstant: 68).isActive = true
+                rowButton.heightAnchor.constraint(equalToConstant: 24).isActive = true
+                rowButton.toolTip = retry ? "请先确认上次操作结果" : "优先使用最早到期的重置卡"
+                rowAction = rowButton
+            }
+            let row = NSStackView(views: [info, NSView(), rowAction])
+            row.identifier = NSUserInterfaceItemIdentifier("reset-credit-row-\(index)")
+            row.orientation = .horizontal
+            row.alignment = .centerY
+            row.spacing = 3
+            row.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            list.addFullWidthArrangedSubview(row)
+        }
+        if credits.isEmpty {
+            let empty = NSTextField(labelWithString: (summary?.availableCount ?? 0) > 0 ? "卡片到期信息暂不可用" : "暂无可用重置卡")
+            empty.font = .systemFont(ofSize: 10)
+            empty.textColor = DesignColors.secondaryText
+            empty.heightAnchor.constraint(equalToConstant: 34).isActive = true
+            list.addFullWidthArrangedSubview(empty)
+        }
+        let scroll = NSScrollView()
+        scroll.identifier = NSUserInterfaceItemIdentifier("reset-credits-list")
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = credits.count > 3
+        scroll.autohidesScrollers = true
+        let document = ResetCreditsDocumentView()
+        document.translatesAutoresizingMaskIntoConstraints = false
+        document.addSubview(list)
+        scroll.documentView = document
+        NSLayoutConstraint.activate([
+            document.widthAnchor.constraint(equalTo: scroll.contentView.widthAnchor),
+            list.leadingAnchor.constraint(equalTo: document.leadingAnchor), list.trailingAnchor.constraint(equalTo: document.trailingAnchor),
+            list.topAnchor.constraint(equalTo: document.topAnchor), list.bottomAnchor.constraint(equalTo: document.bottomAnchor),
+            scroll.heightAnchor.constraint(equalToConstant: CGFloat(max(1, min(3, credits.count))) * 34)
+        ])
+        let fallback = retry ? "上次结果待确认" : ((summary?.availableCount ?? 0) > credits.count ? "卡片详情不完整，暂不可使用" : "")
+        let status = NSTextField(labelWithString: model.resetMessage ?? fallback)
+        status.identifier = NSUserInterfaceItemIdentifier("reset-operation-status")
+        status.font = .systemFont(ofSize: 10)
+        status.textColor = DesignColors.secondaryText
+        status.lineBreakMode = .byTruncatingTail
+        status.toolTip = status.stringValue
+        status.heightAnchor.constraint(equalToConstant: 14).isActive = true
+        let statusRow = NSStackView(views: retry ? [status, NSView(), actions] : [status])
+        statusRow.alignment = .centerY
+        statusRow.spacing = 3
+        let stack = NSStackView(views: [title, scroll, statusRow])
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        title.alignment = .left
+        title.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor), stack.bottomAnchor.constraint(equalTo: bottomAnchor)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    @objc private func useCredit() {
+        guard button.isEnabled else { return }
+        if armed {
+            confirmationTimer?.invalidate()
+            armed = false
+            button.isEnabled = false
+            button.title = "使用中…"
+            cancelButton.isHidden = true
+            cancelButton.isEnabled = false
+            action(retry ? nil : credits.first?.id)
+        } else {
+            armed = true
+            button.title = retry ? "确认重试？" : "确认使用？"
+            button.bezelColor = .systemRed
+            button.contentTintColor = .white
+            button.needsDisplay = true
+            cancelButton.isHidden = false
+            cancelButton.isEnabled = true
+            confirmationTimer = Timer.scheduledTimer(withTimeInterval: 8, repeats: false) { [weak self] _ in
+                self?.cancelConfirmation()
+            }
+        }
+    }
+
+    @objc func cancelConfirmation() {
+        confirmationTimer?.invalidate()
+        confirmationTimer = nil
+        guard armed else { return }
+        armed = false
+        cancelButton.isHidden = true
+        cancelButton.isEnabled = false
+        button.title = retry ? "重试" : "使用"
+        button.bezelColor = nil
+        button.contentTintColor = nil
+        button.needsDisplay = true
+    }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        if newWindow == nil { cancelConfirmation() }
+        super.viewWillMove(toWindow: newWindow)
+    }
+}
+
+private final class ResetCreditsDocumentView: NSView {
+    override var isFlipped: Bool { true }
+}
+
+final class TokenTrendSectionView: NSView {
+    init(trend: TokenQuotaTrend, message: String?) {
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("token-trend-section")
+        let title = NSTextField(labelWithString: "周额度折算")
+        title.font = .systemFont(ofSize: 12, weight: .semibold)
+        let unit = NSTextField(labelWithString: "Tokens / 周")
+        unit.font = .systemFont(ofSize: 10)
+        unit.textColor = DesignColors.secondaryText
+        let row = NSStackView(views: [title, NSView(), unit])
+        row.alignment = .firstBaseline
+        let chart = TokenQuotaChartView(days: trend.days)
+        let footer = NSTextField(labelWithString: message ?? "近 14 天 · 观测折算值")
+        footer.font = .systemFont(ofSize: 9)
+        footer.textColor = DesignColors.secondaryText
+        footer.lineBreakMode = .byTruncatingTail
+        footer.toolTip = "同日、同一周额度周期内：累计 Token 增量 ÷（已用额度百分点增量 / 100），折算整周额度。例如 10 万 Tokens 消耗 2%，折算整周 500 万 Tokens。仅统计观测区间；账户 Token 统计与限额计费口径可能不同，非官方固定上限。"
+        let stack = NSStackView(views: [row, chart, footer])
+        stack.orientation = .vertical
+        stack.alignment = .width
+        stack.spacing = 4
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        addSubview(stack)
+        NSLayoutConstraint.activate([
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor), stack.trailingAnchor.constraint(equalTo: trailingAnchor),
+            stack.topAnchor.constraint(equalTo: topAnchor), stack.bottomAnchor.constraint(equalTo: bottomAnchor),
+            chart.heightAnchor.constraint(equalToConstant: 102), heightAnchor.constraint(equalToConstant: 140)
+        ])
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+}
+
+final class TokenQuotaChartView: NSView {
+    private let days: [TokenQuotaDay]
+    private let calendar = Calendar.current
+    private let endDay: Date
+    init(days: [TokenQuotaDay], now: Date = Date()) {
+        let today = Calendar.current.startOfDay(for: now)
+        endDay = today
+        let start = Calendar.current.date(byAdding: .day, value: -13, to: today)!
+        self.days = days.filter { $0.day >= start && $0.day <= today && $0.percentagePoints > 0 }
+        super.init(frame: .zero)
+        identifier = NSUserInterfaceItemIdentifier("token-quota-chart")
+        let formatter = DateFormatter()
+        formatter.dateFormat = "M/d"
+        toolTip = self.days.map {
+            "\(formatter.string(from: $0.day))：\(Self.compact($0.tokensPerPercent)) Tokens/1% · 观测 \($0.percentagePoints)% · 整周约 \(Self.compact($0.tokensPerPercent * 100)) Tokens"
+        }.joined(separator: "\n")
+        setAccessibilityLabel("周额度 Token 折算趋势")
+        setAccessibilityValue(toolTip ?? "暂无趋势数据")
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+    static func compact(_ value: Double) -> String {
+        if value >= 1_000_000 { return String(format: "%.1fM", value / 1_000_000) }
+        if value >= 1_000 { return String(format: "%.1fK", value / 1_000) }
+        return String(format: "%.0f", value)
+    }
+    override func draw(_ dirtyRect: NSRect) {
+        let plot = NSRect(x: 39, y: 20, width: max(1, bounds.width - 44), height: max(1, bounds.height - 27))
+        let maximum = max(1, (days.map(\.estimatedWeeklyTokens).max() ?? 1) * 1.15)
+        let attributes: [NSAttributedString.Key: Any] = [.font: NSFont.monospacedDigitSystemFont(ofSize: 8, weight: .regular), .foregroundColor: DesignColors.secondaryText]
+        for fraction in [0.0, 0.5, 1.0] {
+            let y = plot.minY + plot.height * fraction
+            let path = NSBezierPath()
+            path.move(to: NSPoint(x: plot.minX, y: y)); path.line(to: NSPoint(x: plot.maxX, y: y))
+            DesignColors.separatorGray.withAlphaComponent(0.2).setStroke(); path.lineWidth = 0.5; path.stroke()
+            if !days.isEmpty { (Self.compact(maximum * fraction) as NSString).draw(at: NSPoint(x: 0, y: y - 4), withAttributes: attributes) }
+        }
+        let formatter = DateFormatter(); formatter.dateFormat = "M/d"
+        for offset in [-13, -7, 0] {
+            let date = calendar.date(byAdding: .day, value: offset, to: endDay)!
+            let label = formatter.string(from: date) as NSString
+            let width = label.size(withAttributes: attributes).width
+            let x = plot.minX + CGFloat(offset + 13) / 13 * plot.width
+            label.draw(at: NSPoint(x: min(max(plot.minX, x - width / 2), bounds.width - width), y: 2), withAttributes: attributes)
+        }
+        if days.isEmpty {
+            let message = "采样中，等待额度变化" as NSString
+            let width = message.size(withAttributes: attributes).width
+            message.draw(at: NSPoint(x: (bounds.width - width) / 2, y: plot.midY), withAttributes: attributes)
+            return
+        }
+        let path = NSBezierPath()
+        var previous: Date?
+        for day in days {
+            let offset = calendar.dateComponents([.day], from: day.day, to: endDay).day ?? 0
+            let point = NSPoint(x: plot.minX + CGFloat(13 - offset) / 13 * plot.width,
+                               y: plot.minY + CGFloat(day.estimatedWeeklyTokens / maximum) * plot.height)
+            if let previous, calendar.dateComponents([.day], from: previous, to: day.day).day == 1 { path.line(to: point) }
+            else { path.move(to: point) }
+            DesignColors.statusBlue.setFill()
+            NSBezierPath(ovalIn: NSRect(x: point.x - 2.5, y: point.y - 2.5, width: 5, height: 5)).fill()
+            previous = day.day
+        }
+        DesignColors.statusBlue.setStroke(); path.lineWidth = 1.8; path.stroke()
     }
 }
 
@@ -2415,9 +2836,24 @@ final class SettingsView: NSViewController {
 
 final class QuotaService {
     private let client = CodexAppServerClient()
+    private let queue = DispatchQueue(label: "CodexQuotaBar.service", qos: .utility)
+
+    func fetchTokenTrend(completion: @escaping (Result<TokenQuotaSample, Error>) -> Void) {
+        queue.async {
+            let result = Result { try self.client.fetchTrendSample() }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
+
+    func consumeReset(_ attempt: ResetAttempt, completion: @escaping (Result<ResetOutcome, Error>) -> Void) {
+        queue.async {
+            let result = Result { try self.client.consumeReset(attempt) }
+            DispatchQueue.main.async { completion(result) }
+        }
+    }
 
     func fetchQuota(completion: @escaping (Result<QuotaSnapshot, Error>) -> Void) {
-        DispatchQueue.global(qos: .utility).async {
+        queue.async {
             do {
                 let snapshot = try self.client.fetchSnapshot(scope: .quotaOnly)
                 DispatchQueue.main.async {

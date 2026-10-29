@@ -60,7 +60,13 @@ private func samplePanelState(
         "rateLimitReachedType": null
       },
       "rateLimitResetCredits": {
-        "availableCount": 4
+        "availableCount": 4,
+        "credits": [
+          {"id":"later","resetType":"codexRateLimits","status":"available","expiresAt":2000000000,"title":"重置卡","description":null},
+          {"id":"earliest","resetType":"codexRateLimits","status":"available","expiresAt":1900000000,"title":"重置卡","description":null},
+          {"id":"no-expiry","resetType":"codexRateLimits","status":"available","expiresAt":null,"title":"重置卡","description":null},
+          {"id":"middle","resetType":"codexRateLimits","status":"available","expiresAt":1950000000,"title":"重置卡","description":null}
+        ]
       }
     }
     """
@@ -436,9 +442,9 @@ struct CodexQuotaUITests {
         )
         controller.loadView()
         let view = controller.view
-        view.frame = NSRect(x: 0, y: 0, width: DesignTokens.panelWidth, height: DesignTokens.panelMinHeight)
+        view.frame = NSRect(x: 0, y: 0, width: DesignTokens.panelWidth, height: view.fittingSize.height)
         view.layoutSubtreeIfNeeded()
-        uiExpect(view.fittingSize.height <= 190, "panel content should fit within the compact quota-only menu-bar panel height")
+        uiExpect(view.fittingSize.height <= DesignTokens.panelMaxHeight, "extended panel should fit the bounded vertical layout")
 
         let usage = view.descendants(ofType: UsageOverviewCard.self).first
         let runtimeCard = view.descendants(ofType: CodexRuntimeStatusCard.self).first
@@ -506,7 +512,7 @@ struct CodexQuotaUITests {
             uiExpect(rowGap >= 0 && rowGap <= 4, "5-hour and 7-day quota rows should be tightly stacked with at most 4pt vertical gap")
         }
         uiExpect(resetCountLabel != nil, "reset credits should remain as a separated auxiliary row")
-        uiExpect(resetCountLabel?.stringValue == "重置次数：4", "reset credits copy should stay short and left aligned")
+        uiExpect(resetCountLabel?.stringValue == "限额同步", "auxiliary row should avoid duplicating the reset card section")
         uiExpect(refreshInfoLabel?.stringValue.hasPrefix("刷新：") == true, "reset credits row should include the last quota refresh time on the right")
         uiExpect(resetCountLabel?.stringValue.contains("·") == false, "reset credits row should not use dot separators")
         uiExpect(refreshInfoLabel?.stringValue.contains("·") == false, "last refresh row should not use dot separators")
@@ -541,7 +547,7 @@ struct CodexQuotaUITests {
         if let resetCountLabel {
             let resetFrame = view.convert(resetCountLabel.bounds, from: resetCountLabel)
             uiExpect(view.bounds.contains(resetFrame), "reset credits auxiliary row should be fully visible")
-            uiExpect(resetFrame.minY <= 8, "reset credits row should sit close to the panel bottom without visible dead space")
+            uiExpect(resetFrame.minY > 140, "sync row should sit above the two new feature sections")
         }
         if let resetCountLabel, let compactQuotaList {
             let resetFrame = compactQuotaList.convert(resetCountLabel.bounds, from: resetCountLabel)
@@ -567,7 +573,47 @@ struct CodexQuotaUITests {
         contentView.layoutSubtreeIfNeeded()
         uiExpect(hostedView.frame.origin == .zero, "panel hosted view should start at the content bounds origin")
         uiExpect(hostedView.frame.size == contentView.bounds.size, "panel hosted view should exactly match panel content bounds")
-        uiExpect(panel.frame.height <= 190, "runtime panel height should not contain unnecessary vertical whitespace")
+        uiExpect(panel.frame.height <= DesignTokens.panelMaxHeight, "runtime panel should fit both new sections")
+        uiExpect(panel.frame.width == 250, "new features must not widen the panel")
+        let resetSection = view.descendants(ofType: ResetCreditsSectionView.self).first
+        let trendSection = view.descendants(ofType: TokenTrendSectionView.self).first
+        uiExpect(resetSection != nil && trendSection != nil, "both new feature sections must be present")
+        if let resetSection, let trendSection {
+            let resetFrame = view.convert(resetSection.bounds, from: resetSection)
+            let trendFrame = view.convert(trendSection.bounds, from: trendSection)
+            uiExpect(view.bounds.contains(resetFrame) && view.bounds.contains(trendFrame), "new sections must remain inside the panel")
+            uiExpect(!resetFrame.intersects(trendFrame), "reset and trend sections must not overlap")
+        }
+        var redemptionCalls = 0
+        var redeemedCreditID: String?
+        let confirmationView = ResetCreditsSectionView(model: state) { creditID in
+            redemptionCalls += 1
+            redeemedCreditID = creditID
+        }
+        uiExpect(confirmationView.descendants(ofType: NSPopUpButton.self).isEmpty, "reset cards should be shown as rows rather than a picker")
+        let creditRows = confirmationView.descendants(ofType: NSView.self).filter { $0.identifier?.rawValue.hasPrefix("reset-credit-row-") == true }
+        uiExpect(creditRows.count == 4, "every returned card should have its own row including cards without expiry")
+        let rowButtons = creditRows.flatMap { $0.descendants(ofType: NSButton.self) }.filter { $0.title == "使用" }
+        uiExpect(rowButtons.count == 4 && rowButtons.filter(\.isEnabled).count == 1, "only one row may enable redemption")
+        let firstRow = creditRows.first { $0.identifier?.rawValue == "reset-credit-row-0" }
+        uiExpect(firstRow?.descendants(ofType: NSButton.self).first(where: { $0.title == "使用" })?.isEnabled == true, "the earliest expiry row must own the enabled button")
+        uiExpect(confirmationView.descendants(ofType: NSScrollView.self).first?.hasVerticalScroller == true, "long card lists should scroll within the existing panel width")
+        guard let useButton = confirmationView.descendants(ofType: NSButton.self).first(where: { $0.identifier?.rawValue == "use-reset-credit" }) else { fatalError("missing reset button") }
+        guard let cancelButton = confirmationView.descendants(ofType: NSButton.self).first(where: { $0.identifier?.rawValue == "cancel-reset-credit" }) else { fatalError("missing cancel button") }
+        uiExpect(cancelButton.isHidden, "cancel should only be visible while confirmation is armed")
+        useButton.performClick(nil)
+        uiExpect(redemptionCalls == 0 && useButton.title == "确认使用？", "first click must only arm confirmation")
+        uiExpect(useButton.bezelColor == .systemRed, "confirmation button must become red")
+        uiExpect(!cancelButton.isHidden && cancelButton.isEnabled, "arming must show an enabled cancel button")
+        cancelButton.performClick(nil)
+        uiExpect(useButton.title == "使用" && redemptionCalls == 0 && cancelButton.isHidden, "cancel must restore the use button without sending a redemption")
+        useButton.performClick(nil)
+        useButton.performClick(nil)
+        uiExpect(redemptionCalls == 1 && !useButton.isEnabled, "second click must send exactly one request and disable repeated clicks")
+        uiExpect(cancelButton.isHidden && !cancelButton.isEnabled, "cancel must disappear once the confirmed request starts")
+        uiExpect(redeemedCreditID == "earliest", "redemption must select the closest expiry rather than API response order")
+        let staleCards = ResetCreditsSectionView(model: samplePanelState(loadState: .staleCache)) { _ in fatalError("stale cards must not redeem") }
+        uiExpect(staleCards.descendants(ofType: NSButton.self).allSatisfy { !$0.isEnabled }, "cached card rows must await a fresh quota response")
 
         let weeklyOnlyController = QuotaPopoverViewController(
             model: weeklyOnlyState,

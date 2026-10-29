@@ -8,6 +8,9 @@ TARGET_ARCH="${TARGET_ARCH:-$(uname -m)}"
 mkdir -p "$BUILD_DIR"
 mkdir -p "$BUILD_DIR/module-cache"
 
+swiftc -parse-as-library -module-cache-path "$BUILD_DIR/module-cache" \
+  "$ROOT/Tests/MockAppServer.swift" -o "$BUILD_DIR/MockAppServer"
+
 swiftc \
   -module-cache-path "$BUILD_DIR/module-cache" \
   -target "$TARGET_ARCH"-apple-macosx"$MACOS_DEPLOYMENT_TARGET" \
@@ -16,7 +19,7 @@ swiftc \
   "$ROOT/Tests/CodexQuotaCoreTests.swift" \
   -o "$BUILD_DIR/CodexQuotaCoreTests"
 
-"$BUILD_DIR/CodexQuotaCoreTests"
+"$BUILD_DIR/CodexQuotaCoreTests" "$BUILD_DIR/MockAppServer"
 
 swiftc \
   -D PREVIEW_RENDERER \

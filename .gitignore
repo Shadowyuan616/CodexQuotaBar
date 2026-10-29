@@ -17,5 +17,7 @@ dist/
 .env.*
 quota-cache.json
 quota-history.json
+token-quota-trend.json
+pending-reset.json
 /preview*.png
 screenshots/

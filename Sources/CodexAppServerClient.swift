@@ -1,4 +1,5 @@
 import Foundation
+import CryptoKit
 
 enum CodexAppServerClientError: Error, CustomStringConvertible {
     case codexBinaryMissing(String)
@@ -119,6 +120,50 @@ final class CodexAppServerClient {
     }
 
     func fetchSnapshot(scope: CodexQuotaFetchScope = .quotaOnly) throws -> QuotaSnapshot {
+        try withSession { request in
+            let data = try request("account/rateLimits/read", NSNull())
+            return QuotaSnapshot(rateLimits: try self.decoder.decode(AccountRateLimitsResponse.self, from: data), fetchedAt: Date())
+        }
+    }
+
+    func consumeReset(_ attempt: ResetAttempt) throws -> ResetOutcome {
+        try withSession { request in
+            let current = try self.decoder.decode(AccountRateLimitsResponse.self, from: request("account/rateLimits/read", NSNull()))
+            guard let account = current.accountId, Self.accountScope(account) == attempt.accountScope else {
+                throw CodexAppServerClientError.serverError("账户已变化，请切回发起重置的账户")
+            }
+            var params: [String: Any] = ["idempotencyKey": attempt.key]
+            if let creditId = attempt.creditId { params["creditId"] = creditId }
+            let data = try request("account/rateLimitResetCredit/consume", params)
+            return try self.decoder.decode(ResetResponse.self, from: data).outcome
+        }
+    }
+
+    static func accountScope(_ accountID: String) -> String {
+        SHA256.hash(data: Data(accountID.utf8)).map { String(format: "%02x", $0) }.joined()
+    }
+
+    func fetchTrendSample() throws -> TokenQuotaSample {
+        try withSession { request in
+            let before = try self.decoder.decode(AccountRateLimitsResponse.self, from: request("account/rateLimits/read", NSNull()))
+            let usage = try self.decoder.decode(TokenUsageResponse.self, from: request("account/usage/read", NSNull()))
+            let after = try self.decoder.decode(AccountRateLimitsResponse.self, from: request("account/rateLimits/read", NSNull()))
+            let first = QuotaSnapshot(rateLimits: before, fetchedAt: Date()).quotaWindow(matching: 10080)
+            let last = QuotaSnapshot(rateLimits: after, fetchedAt: Date()).quotaWindow(matching: 10080)
+            guard let account = after.accountId, before.accountId == account,
+                  let window = last, let resetAt = window.resetsAt,
+                  first?.usedPercent == window.usedPercent, first?.resetsAt == resetAt,
+                  let tokens = usage.summary.lifetimeTokens, tokens >= 0 else {
+                throw CodexAppServerClientError.serverError("暂未取得一致的 Token 与周额度样本")
+            }
+            let scope = account + "|" + (after.rateLimits?.planType ?? "")
+            let fingerprint = Self.accountScope(scope)
+            return TokenQuotaSample(timestamp: Date(), accountScope: fingerprint, totalTokens: tokens,
+                                    usedPercent: window.usedPercent, resetsAt: resetAt)
+        }
+    }
+
+    private func withSession<T>(_ body: (_ request: (String, Any) throws -> Data) throws -> T) throws -> T {
         guard FileManager.default.isExecutableFile(atPath: codexPath) else {
             throw CodexAppServerClientError.codexBinaryMissing(codexPath)
         }
@@ -135,15 +180,12 @@ final class CodexAppServerClient {
         process.standardOutput = stdout
         process.standardError = stderr
 
-        var stderrText = ""
-        stderr.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if !data.isEmpty, let text = String(data: data, encoding: .utf8) {
-                stderrText += text
-            }
-        }
+        // Drain diagnostics without retaining credentials or unbounded subprocess output.
+        stderr.fileHandleForReading.readabilityHandler = { _ = $0.availableData }
 
         try process.run()
+        let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 45, execute: deadline)
         let reader = FileHandleLineReader(fileHandle: stdout.fileHandleForReading)
         let writer = stdin.fileHandleForWriting
         var nextId = 1
@@ -152,7 +194,7 @@ final class CodexAppServerClient {
             let id = nextId
             nextId += 1
             try writeJSONLine(["id": id, "method": method, "params": params], to: writer)
-            return try readResult(expectedId: id, reader: reader, process: process, stderrText: stderrText)
+            return try readResult(expectedId: id, reader: reader, process: process, stderrText: "限额服务返回未知错误")
         }
 
         func sendNotification(method: String, params: Any) throws {
@@ -160,6 +202,7 @@ final class CodexAppServerClient {
         }
 
         defer {
+            deadline.cancel()
             stderr.fileHandleForReading.readabilityHandler = nil
             try? writer.close()
             if process.isRunning {
@@ -173,9 +216,7 @@ final class CodexAppServerClient {
         ])
         try sendNotification(method: "initialized", params: NSNull())
 
-        let rateLimitData = try sendRequest(method: "account/rateLimits/read", params: NSNull())
-        let rateLimits = try decoder.decode(AccountRateLimitsResponse.self, from: rateLimitData)
-        return QuotaSnapshot(rateLimits: rateLimits, fetchedAt: Date())
+        return try body(sendRequest)
     }
 
     private func readResult(expectedId: Int, reader: FileHandleLineReader, process: Process, stderrText: String) throws -> Data {

@@ -410,8 +410,8 @@ struct CodexQuotaUITests {
             let mainGlass = glassView.descendants(ofType: NSGlassEffectView.self).first
             uiExpect(mainGlass?.style == .regular, "main panel should use the standard regular Liquid Glass style")
             uiExpect(mainGlass?.tintColor == nil, "main panel should let regular Liquid Glass sample the background without a custom tint")
-            if #available(macOS 27.0, *) {
-                uiExpect(mainGlass?.effectIsInteractive == false, "main content glass should remain noninteractive")
+            if mainGlass?.responds(to: NSSelectorFromString("effectIsInteractive")) == true {
+                uiExpect(mainGlass?.value(forKey: "effectIsInteractive") as? Bool == false, "main content glass should remain noninteractive")
             }
         }
         let materialFreeCard = GlassCard()

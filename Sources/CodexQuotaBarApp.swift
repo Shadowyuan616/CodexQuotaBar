@@ -1627,9 +1627,8 @@ class GlassPanel: NSView {
             glass.cornerRadius = DesignTokens.panelCornerRadius
             glass.style = .regular
             glass.tintColor = nil
-            if #available(macOS 27.0, *) {
-                glass.effectIsInteractive = false
-            }
+            // Glass is noninteractive by default, including on macOS 27.
+            // Avoid referencing its newer setter so macOS 26 SDK builds remain supported.
             addSubview(glass)
             glass.contentView = contentContainer
             NSLayoutConstraint.activate([
